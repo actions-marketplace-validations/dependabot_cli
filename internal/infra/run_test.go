@@ -2,10 +2,13 @@ package infra
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,6 +57,252 @@ func Test_setImageNames(t *testing.T) {
 			t.Error("expected error for unknown package manager, got nil")
 		}
 	})
+}
+
+func TestRunContainersRejectsUnverifiedImages(t *testing.T) {
+	var mu sync.Mutex
+	writes := 0
+	docker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			mu.Lock()
+			writes++
+			mu.Unlock()
+			t.Errorf("Docker write before image verification: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/json") {
+			writeJSON(t, w, map[string]any{"Id": "unsigned-image", "RepoDigests": []string{}})
+			return
+		}
+		w.Header().Set("API-Version", testDockerAPIVersion)
+		fmt.Fprint(w, "OK")
+	}))
+	defer docker.Close()
+	t.Setenv("DOCKER_HOST", docker.URL)
+	t.Setenv("DOCKER_API_VERSION", testDockerAPIVersion)
+	t.Setenv("DOCKER_TLS_VERIFY", "")
+	t.Setenv("DOCKER_CERT_PATH", "")
+	err := runContainers(t.Context(), RunParams{
+		Job: &model.Job{}, ProxyImage: "unsigned-proxy", UpdaterImage: "unsigned-updater",
+	})
+	if err == nil || !strings.Contains(err.Error(), "no matching repository digest") {
+		t.Fatalf("runContainers() = %v, want unsigned image rejection", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if writes != 0 {
+		t.Fatalf("performed %d Docker writes before verification", writes)
+	}
+}
+
+func TestRunContainersRejectsUnverifiedCollector(t *testing.T) {
+	var mu sync.Mutex
+	writes := 0
+	docker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			mu.Lock()
+			writes++
+			mu.Unlock()
+			t.Errorf("Docker write before Collector verification: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/v1.44/images/") && strings.HasSuffix(r.URL.Path, "/json") {
+			imageName := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1.44/images/"), "/json")
+			var digests []string
+			if imageName != "collector" {
+				digests = []string{imageName + "@sha256:" + strings.Repeat("a", 64)}
+			}
+			writeJSON(t, w, map[string]any{"Id": "local-" + imageName, "RepoDigests": digests})
+			return
+		}
+		w.Header().Set("API-Version", testDockerAPIVersion)
+		fmt.Fprint(w, "OK")
+	}))
+	defer docker.Close()
+	t.Setenv("DOCKER_HOST", docker.URL)
+	t.Setenv("DOCKER_API_VERSION", testDockerAPIVersion)
+	t.Setenv("DOCKER_TLS_VERIFY", "")
+	t.Setenv("DOCKER_CERT_PATH", "")
+	err := runContainers(t.Context(), RunParams{
+		Job: &model.Job{}, ProxyImage: "proxy", UpdaterImage: "updater",
+		CollectorImage: "collector", CollectorConfigPath: filepath.Join(t.TempDir(), "collector.yaml"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "collector image") || !strings.Contains(err.Error(), "no matching repository digest") {
+		t.Fatalf("runContainers() = %v, want unsigned Collector rejection", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if writes != 0 {
+		t.Fatalf("performed %d Docker writes before Collector verification", writes)
+	}
+}
+
+func TestRunContainersCollectorPullFailure(t *testing.T) {
+	docker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/_ping":
+			w.Header().Set("API-Version", testDockerAPIVersion)
+			fmt.Fprint(w, "OK")
+		case r.Method == http.MethodGet && r.URL.Path == "/v1.44/images/cached-proxy/json":
+			writeJSON(t, w, map[string]any{"Id": "local-proxy", "RepoDigests": []string{}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1.44/images/missing-collector/json":
+			w.WriteHeader(http.StatusNotFound)
+			writeJSON(t, w, map[string]string{"message": "image not found"})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.44/images/create":
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(t, w, map[string]string{"message": "collector pull denied"})
+		default:
+			t.Errorf("Docker operation after Collector pull failure: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(t, w, map[string]string{"message": "unexpected Docker operation"})
+		}
+	}))
+	defer docker.Close()
+	t.Setenv("DOCKER_HOST", docker.URL)
+	t.Setenv("DOCKER_API_VERSION", testDockerAPIVersion)
+	t.Setenv("DOCKER_TLS_VERIFY", "")
+	t.Setenv("DOCKER_CERT_PATH", "")
+	err := runContainers(t.Context(), RunParams{
+		Job: &model.Job{}, ProxyImage: "cached-proxy", UpdaterImage: "unused-updater",
+		CollectorImage: "missing-collector", CollectorConfigPath: filepath.Join(t.TempDir(), "collector.yaml"),
+		PullImages: true, SkipImageVerification: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "OpenTelemetry collector") || !strings.Contains(err.Error(), "collector pull denied") {
+		t.Fatalf("runContainers() = %v, want Collector pull failure", err)
+	}
+}
+
+func TestRunContainersCollectorStartupFailure(t *testing.T) {
+	for _, stage := range []string{"create", "start"} {
+		t.Run(stage, func(t *testing.T) {
+			var mu sync.Mutex
+			var noInternetName string
+			var created []string
+			removedProxy, removedNetworks := false, 0
+			docker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case r.URL.Path == "/_ping":
+					w.Header().Set("API-Version", testDockerAPIVersion)
+					fmt.Fprint(w, "OK")
+				case r.Method == http.MethodPost && r.URL.Path == "/v1.44/networks/create":
+					var cfg struct {
+						Name     string
+						Internal bool
+					}
+					if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+						t.Error(err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					id := "internet"
+					if cfg.Internal {
+						id, noInternetName = "no-internet", cfg.Name
+					}
+					writeJSON(t, w, map[string]string{"Id": id})
+				case r.Method == http.MethodPost && r.URL.Path == "/v1.44/containers/create":
+					var cfg struct{ Image string }
+					if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+						t.Error(err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					created = append(created, cfg.Image)
+					if cfg.Image == "collector" && stage == "create" {
+						w.WriteHeader(http.StatusInternalServerError)
+						writeJSON(t, w, map[string]string{"message": "collector create denied"})
+					} else if cfg.Image == "proxy" || cfg.Image == "collector" {
+						writeJSON(t, w, map[string]string{"Id": cfg.Image})
+					} else {
+						t.Errorf("created updater after Collector failure: %s", cfg.Image)
+						w.WriteHeader(http.StatusInternalServerError)
+					}
+				case r.Method == http.MethodGet && r.URL.Path == "/v1.44/containers/proxy/json":
+					writeJSON(t, w, map[string]any{
+						"Id": "proxy", "State": map[string]any{"Running": true, "ExitCode": 0},
+						"NetworkSettings": map[string]any{"Networks": map[string]any{
+							noInternetName: map[string]string{"IPAddress": "192.0.2.2"},
+						}},
+					})
+				case r.Method == http.MethodPost && r.URL.Path == "/v1.44/containers/collector/start":
+					w.WriteHeader(http.StatusInternalServerError)
+					writeJSON(t, w, map[string]string{"message": "collector start denied"})
+				case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/archive"),
+					r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/connect"),
+					r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"),
+					r.Method == http.MethodPost && r.URL.Path == "/v1.44/containers/proxy/start":
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1.44/containers/"):
+					removedProxy = removedProxy || r.URL.Path == "/v1.44/containers/proxy"
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1.44/networks/"):
+					removedNetworks++
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					t.Errorf("unexpected Docker request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer docker.Close()
+			t.Setenv("DOCKER_HOST", docker.URL)
+			t.Setenv("DOCKER_API_VERSION", testDockerAPIVersion)
+			t.Setenv("DOCKER_TLS_VERIFY", "")
+			t.Setenv("DOCKER_CERT_PATH", "")
+			err := runContainers(t.Context(), RunParams{
+				Job: &model.Job{}, ProxyImage: "proxy", UpdaterImage: "unused-updater",
+				CollectorImage: "collector", CollectorConfigPath: filepath.Join(t.TempDir(), "collector.yaml"),
+				SkipImageVerification: true, Debug: true,
+			})
+			if err == nil || !strings.Contains(err.Error(), "collector "+stage+" denied") {
+				t.Fatalf("runContainers() = %v, want Collector %s failure", err, stage)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if strings.Join(created, ",") != "proxy,collector" || !removedProxy || removedNetworks != 2 {
+				t.Fatalf("created = %v, proxy removed = %v, networks removed = %d", created, removedProxy, removedNetworks)
+			}
+		})
+	}
+}
+
+func TestRunContainersExplicitVerificationBypass(t *testing.T) {
+	var output bytes.Buffer
+	previousOutput := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previousOutput) })
+	docker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1.44/networks/create" {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(t, w, map[string]string{"message": "stopped after explicit bypass"})
+			return
+		}
+		if r.URL.Path == "/_ping" {
+			w.Header().Set("API-Version", testDockerAPIVersion)
+			fmt.Fprint(w, "OK")
+			return
+		}
+		t.Errorf("unexpected verification request during bypass: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer docker.Close()
+	t.Setenv("DOCKER_HOST", docker.URL)
+	t.Setenv("DOCKER_API_VERSION", testDockerAPIVersion)
+	t.Setenv("DOCKER_TLS_VERIFY", "")
+	t.Setenv("DOCKER_CERT_PATH", "")
+	err := runContainers(t.Context(), RunParams{
+		Job: &model.Job{}, ProxyImage: "unsigned-proxy", UpdaterImage: "unsigned-updater",
+		CollectorImage: "unsigned-collector", CollectorConfigPath: filepath.Join(t.TempDir(), "collector.yaml"),
+		SkipImageVerification: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "stopped after explicit bypass") {
+		t.Fatalf("runContainers() = %v, want legacy execution after explicit bypass", err)
+	}
+	if !strings.Contains(output.String(), "WARNING: updater, proxy, and OpenTelemetry collector image verification is disabled") {
+		t.Fatalf("missing bypass warning: %s", output.String())
+	}
 }
 
 func Test_RunParamsValidateCooldown(t *testing.T) {

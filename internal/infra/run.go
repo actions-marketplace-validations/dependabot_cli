@@ -69,6 +69,8 @@ type RunParams struct {
 	ProxyCertPath string
 	// attempt to pull images if they aren't local?
 	PullImages bool
+	// SkipImageVerification permits unsigned development updater, proxy, and collector images.
+	SkipImageVerification bool
 	// run an interactive shell?
 	Debug bool
 	// generate performance metrics?
@@ -403,20 +405,34 @@ func runContainers(ctx context.Context, params RunParams) (err error) {
 		return fmt.Errorf("failed to create Docker client: %w", err)
 	}
 
+	requestedProxyImage, requestedUpdaterImage := params.ProxyImage, params.UpdaterImage
+	requestedCollectorImage := params.CollectorImage
+	pullProtectedImage := func(ctx context.Context, cli *client.Client, imageName, _ string) error {
+		return pullImage(ctx, cli, imageName)
+	}
+	if params.SkipImageVerification {
+		log.Println("WARNING: updater, proxy, and OpenTelemetry collector image verification is disabled. Only run trusted development images.")
+	} else {
+		if err := verifyImages(ctx, cli, &params, newImageVerifier); err != nil {
+			return err
+		}
+		pullProtectedImage = pullVerifiedImage
+	}
+
 	if params.PullImages {
-		err = pullImage(ctx, cli, params.ProxyImage)
+		err = pullProtectedImage(ctx, cli, params.ProxyImage, requestedProxyImage)
 		if err != nil {
 			return err
 		}
 
 		if params.CollectorConfigPath != "" {
-			err = pullImage(ctx, cli, params.CollectorImage)
+			err = pullProtectedImage(ctx, cli, params.CollectorImage, requestedCollectorImage)
 			if err != nil {
-				fmt.Println("Failed to pull OpenTelemetry collector image:", err)
+				return fmt.Errorf("failed to pull OpenTelemetry collector image: %w", err)
 			}
 		}
 
-		err = pullImage(ctx, cli, params.UpdaterImage)
+		err = pullProtectedImage(ctx, cli, params.UpdaterImage, requestedUpdaterImage)
 		if err != nil {
 			return err
 		}
@@ -454,7 +470,7 @@ func runContainers(ctx context.Context, params RunParams) (err error) {
 	if params.CollectorConfigPath != "" {
 		collector, err = NewCollector(ctx, cli, networks, &params, prox)
 		if err != nil {
-			fmt.Println("Failed to create OpenTelemetry collector:", err)
+			return fmt.Errorf("failed to create OpenTelemetry collector: %w", err)
 		}
 		if !params.Debug {
 			go collector.TailLogs(ctx, cli)

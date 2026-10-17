@@ -51,11 +51,70 @@ Available Commands:
 Flags:
   -h, --help                   help for dependabot
       --proxy-image string     container image to use for the proxy (default "ghcr.io/dependabot/proxy:latest")
+      --skip-image-verification   skip updater, proxy, and configured OpenTelemetry collector image verification for trusted development images
       --updater-image string   container image to use for the updater
   -v, --version                version for dependabot
 
 Use "dependabot [command] --help" for more information about a command.
 ```
+
+### Image verification
+
+The CLI requires valid GitHub build attestations for updater and proxy images before it starts any containers.
+When Collector configuration is supplied, it also requires a valid OpenTelemetry Collector image signature.
+An attestation is a signed claim about an artifact.
+Provenance records an image's build origin.
+Bundles contain the signed claims and verification evidence.
+This policy is enabled by default for `update`, `test`, `graph`, and the Docker Action in this repository.
+
+An image digest identifies its exact content.
+The CLI requires a valid signature and matching digest, issuer, repository, workflow identity, and source ref.
+It uses the verified digest for image pulls and container creation.
+
+The accepted issuer is `https://token.actions.githubusercontent.com`.
+Updater and proxy images require SLSA build provenance from `refs/heads/main`.
+Collector images require Cosign image signatures from stable `refs/tags/vMAJOR.MINOR.PATCH` releases.
+These signatures identify the image and publisher without describing the build.
+The publisher workflows are:
+
+| Image | Repository | Workflow |
+| --- | --- | --- |
+| Updater | `dependabot/dependabot-core` | `.github/workflows/images-latest.yml` |
+| Proxy | `dependabot/proxy` | `.github/workflows/ghcr.yml` |
+| Collector | `open-telemetry/opentelemetry-collector-releases` | `.github/workflows/base-release.yaml` |
+
+For a Collector version such as `:0.161.0`, both the workflow identity and certificate source ref must name `refs/tags/v0.161.0`.
+The version is still enforced when the reference also includes a digest.
+For `latest`, other non-version tags, and digest-only references, any stable release from that same workflow is accepted.
+The certificate source ref must still match the release in the workflow identity.
+Prerelease and manually signed Collector images are not accepted.
+Collector verification, pull, or startup failures stop the job.
+
+Image overrides must satisfy the same producer policy.
+Registry mirrors must preserve the image digest and attestation bundles.
+Missing or invalid attestations cause an error.
+
+With `--pull=false`, the CLI verifies the cached image's repository digest and runs that image.
+It does not switch to a newer registry tag.
+It still needs network access for attestations and Sigstore trust metadata.
+The CLI uses existing registry credentials, not updater-job credentials, to retrieve bundles.
+
+Storage images are not verified.
+The CLI records the signed producer commit, but does not enforce an independently approved commit or image freshness.
+Branch builds and images from other producers require the development bypass below.
+
+Only use `--skip-image-verification` with trusted development images.
+This flag disables updater, proxy, and configured Collector verification and prints a warning.
+For example:
+
+```sh
+dependabot update go_modules dependabot/cli \
+  --updater-image my-updater \
+  --skip-image-verification
+```
+
+The Docker Action exposes the same bypass through its `skip-image-verification` input, which defaults to `'false'`.
+Do not use this bypass to ignore unexpected signatures or provenance in production.
 
 ### `dependabot update`
 
